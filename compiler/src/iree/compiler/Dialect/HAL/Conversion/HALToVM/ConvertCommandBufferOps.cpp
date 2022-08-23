@@ -15,6 +15,59 @@ namespace mlir {
 namespace iree_compiler {
 namespace {
 
+// TODO(benvanik): import op handling of optional values.
+// It'd be nice if the Optional<Index>:$binding_capacity could be emitted as 0
+// when not present; today it'll be omitted entirely (as it's not in the operand
+// set) but we need it for the fixed call signature.
+class CommandBufferCreateOpConversion
+    : public OpConversionPattern<IREE::HAL::CommandBufferCreateOp> {
+ public:
+  CommandBufferCreateOpConversion(MLIRContext *context,
+                                  SymbolTable &importSymbols,
+                                  TypeConverter &typeConverter,
+                                  StringRef importName)
+      : OpConversionPattern(typeConverter, context) {
+    importOp = importSymbols.lookup<IREE::VM::ImportOp>(importName);
+    assert(importOp);
+  }
+
+  LogicalResult matchAndRewrite(
+      IREE::HAL::CommandBufferCreateOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+    auto importType = importOp.getFunctionType();
+
+    SmallVector<Value, 8> callOperands = {
+        adaptor.getDevice(),
+    };
+    auto modesValue = detail::rewriteAttrToOperands(
+        op.getLoc(), adaptor.getModesAttr(), rewriter.getI32Type(), rewriter);
+    if (!modesValue.has_value()) return failure();
+    callOperands.append(modesValue.value());
+    auto categoriesValue = detail::rewriteAttrToOperands(
+        op.getLoc(), adaptor.getCommandCategoriesAttr(), rewriter.getI32Type(),
+        rewriter);
+    if (!categoriesValue.has_value()) return failure();
+    callOperands.append(categoriesValue.value());
+    if (adaptor.getBindingCapacity()) {
+      callOperands.push_back(castToImportType(adaptor.getBindingCapacity(),
+                                              rewriter.getI32Type(), rewriter));
+    } else {
+      callOperands.push_back(
+          rewriter.create<IREE::VM::ConstI32ZeroOp>(op.getLoc()));
+    }
+
+    auto callOp = rewriter.replaceOpWithNewOp<IREE::VM::CallOp>(
+        op, SymbolRefAttr::get(importOp), importType.getResults(),
+        callOperands);
+
+    copyImportAttrs(importOp, callOp);
+    return success();
+  }
+
+ private:
+  mutable IREE::VM::ImportOp importOp;
+};
+
 class CommandBufferFillBufferOpConversion
     : public OpConversionPattern<IREE::HAL::CommandBufferFillBufferOp> {
  public:
@@ -88,6 +141,23 @@ class CommandBufferPushDescriptorSetOpConversion
       ConversionPatternRewriter &rewriter) const override {
     auto importType = importOp.getFunctionType();
 
+    Value zero;
+    auto getI32Zero = [&]() {
+      if (!zero) {
+        zero = rewriter.create<IREE::VM::ConstI32ZeroOp>(op.getLoc());
+      }
+      return zero;
+    };
+    Value null;
+    auto getNull = [&]() {
+      if (!null) {
+        null = rewriter.create<IREE::VM::ConstRefZeroOp>(
+            op.getLoc(),
+            IREE::VM::RefType::get(rewriter.getType<IREE::HAL::BufferType>()));
+      }
+      return null;
+    };
+
     SmallVector<Value, 8> callOperands = {
         adaptor.getCommandBuffer(),
         adaptor.getPipelineLayout(),
@@ -102,7 +172,16 @@ class CommandBufferPushDescriptorSetOpConversion
     };
     for (size_t i = 0; i < adaptor.getBindingOrdinals().size(); ++i) {
       callOperands.push_back(adaptor.getBindingOrdinals()[i]);
-      callOperands.push_back(adaptor.getBindingBuffers()[i]);
+      auto bindingBuffer = adaptor.getBindingBuffers()[i];
+      if (bindingBuffer.getType().isa<IREE::VM::RefType>()) {
+        // Buffer binding; pass 0 for table slot.
+        callOperands.push_back(getI32Zero());
+        callOperands.push_back(bindingBuffer);
+      } else {
+        // Binding table reference; pass null for the buffer.
+        callOperands.push_back(bindingBuffer);
+        callOperands.push_back(getNull());
+      }
       callOperands.push_back(castToImportType(adaptor.getBindingOffsets()[i],
                                               rewriter.getI64Type(), rewriter));
       callOperands.push_back(castToImportType(adaptor.getBindingLengths()[i],
@@ -126,7 +205,7 @@ void populateHALCommandBufferToVMPatterns(MLIRContext *context,
                                           SymbolTable &importSymbols,
                                           TypeConverter &typeConverter,
                                           RewritePatternSet &patterns) {
-  patterns.insert<VMImportOpConversion<IREE::HAL::CommandBufferCreateOp>>(
+  patterns.insert<CommandBufferCreateOpConversion>(
       context, importSymbols, typeConverter, "hal.command_buffer.create");
   patterns.insert<VMImportOpConversion<IREE::HAL::CommandBufferFinalizeOp>>(
       context, importSymbols, typeConverter, "hal.command_buffer.finalize");
